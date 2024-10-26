@@ -25,7 +25,7 @@
 //! (which use PCLK1 without that implicit *2 factor)
 //! run at 4 MHz by default.
 //!
-//! USART1 uses PCLK2, which uses the APB2 prescaler on HCLK,
+//! We force USART1 to use HSI, which uses the APB2 prescaler on HCLK,
 //! default APB2 prescaler = /1:
 //!
 //! ```
@@ -80,13 +80,14 @@ pub fn parse_pin(comptime spec: []const u8) type {
     if (spec[1] < 'A' or spec[1] > 'H')
         @compileError(invalid_format_msg);
 
-    const pin_number: comptime_int = std.fmt.parseInt(u4, spec[2..], 10) catch @compileError(invalid_format_msg);
-
     return struct {
-        /// 'A'...'H'
-        const gpio_port_name = spec[1..2];
-        const gpio_port = @field(peripherals, "GPIO" ++ gpio_port_name);
-        const suffix = std.fmt.comptimePrint("{d}", .{pin_number});
+        pub const source_pin = struct {
+            /// 'A'...'H'
+            const gpio_port_name = spec[1..2];
+            const gpio_port = @field(peripherals, "GPIO" ++ gpio_port_name);
+            const number: comptime_int = std.fmt.parseInt(u4, spec[2..], 10) catch @compileError(invalid_format_msg);
+            const suffix = std.fmt.comptimePrint("{d}", .{number});
+        };
     };
 }
 
@@ -117,6 +118,17 @@ pub const gpio = struct {
         switch (state) {
             .low => set_reg_field(&(pin.gpio_port.BRR), "BR" ++ pin.suffix, 1),
             .high => set_reg_field(&(pin.gpio_port.BSRR), "BS" ++ pin.suffix, 1),
+        }
+    }
+
+    pub const AlternateFunction = enum { AF0, AF1, AF2, AF3, AF4, AF5, AF6, AF7, AF8, AF9, AF10, AF11, AF12, AF13, AF14, AF15 };
+
+    pub fn set_alternate_function(comptime pin: type, af: AlternateFunction) void {
+        set_reg_field(&(RCC.AHBENR), "IOP" ++ pin.gpio_port_name ++ "EN", 1);
+        if (pin.number < 8) {
+            set_reg_field(&@field(pin.gpio_port, "AFRL"), "AFRH" ++ pin.suffix, @intFromEnum(af));
+        } else {
+            set_reg_field(&@field(pin.gpio_port, "AFRH"), "AFRH" ++ pin.suffix, @intFromEnum(af));
         }
     }
 };
@@ -163,8 +175,11 @@ pub fn Uart(comptime index: usize, comptime pins: microzig_uart.Pins) type {
             RCC.APB2ENR.modify(.{ .USART1EN = 1 });
             // enable GPIOC clock
             RCC.AHBENR.modify(.{ .IOPCEN = 1 });
+            // make sure USART1 uses HSI 8MHz clock (later: do something else)
+            RCC.CFGR3.modify(.{ .USART1SW = 0b11 });
             // set PC4+PC5 to alternate function 7, USART1_TX + USART1_RX
             GPIOC.MODER.modify(.{ .MODER4 = 0b10, .MODER5 = 0b10 });
+            GPIOC.OSPEEDR.modify(.{ .OSPEEDR4 = 0b11, .OSPEEDR5 = 0b11 });
             GPIOC.AFRL.modify(.{ .AFRL4 = 7, .AFRL5 = 7 });
 
             // clear USART1 configuration to its default
@@ -533,15 +548,14 @@ pub fn SpiBus(comptime index: usize) type {
 
         /// Switch this SPI bus to the given device.
         pub fn switch_to_device(_: Self, comptime cs_pin: type, config: microzig_spi.DeviceConfig) void {
-            _ = config; // for future use
-
             SPI1.CR1.modify(.{
-                .CPOL = 1, // TODO: make configurable
-                .CPHA = 1, // TODO: make configurable
-                .BR = 0b111, // 1/256 the of PCLK TODO: make configurable
+                .CPOL = 0, // TODO: make configurable
+                .CPHA = 0, // TODO: make configurable
+                .BR = 0b111, // baud rate = (1/2^(BR+1)) of PCLK, TODO: make configurable
                 .LSBFIRST = 0, // MSB first TODO: make configurable
             });
             gpio.set_output(cs_pin);
+            SPI1.CR1.modify(.{ .BIDIMODE = @intFromBool(config.bidi) });
         }
 
         /// Begin a transfer to the given device.  (Assumes `switch_to_device()` was called.)
@@ -650,13 +664,35 @@ pub fn SpiBus(comptime index: usize) type {
 
         pub fn end_transfer(_: Self, comptime cs_pin: type, config: microzig_spi.DeviceConfig) void {
             _ = config; // for future use
+            // HACK: wait long enough to make any device end an ongoing transfer
+            if (false) {
+                var i: u32 = 1_000_000; // with the default clock, this seems to delay ~185 microseconds
+                while (i > 0) : (i -= 1) {
+                    microzig.cpu.nop();
+                }
+            }
+            if (false) {
+                // if (bidi_mode) {
+                // wait for the bi-directional line to be 'free'
+                while (SPI1.SR.read().BSY == 1) {}
+                debug_print("SPI1.SR.BSY == 0.\r\n", .{});
+                // }
+            }
             // no delay should be needed here, since we know SPIx_SR's TXE is 1
             debug_print("(disabling SPI1)\r\n", .{});
             gpio.write(cs_pin, .high); // deselect the given device, TODO: support inverse CS devices
-            // HACK: wait long enough to make any device end an ongoing transfer
-            var i: u8 = 255; // with the default clock, this seems to delay ~185 microseconds
-            while (i > 0) : (i -= 1) {
-                asm volatile ("nop");
+            if (false) {
+                while (true) {
+                    const sr = SPI1.SR.read();
+                    if (sr.FRLVL == 0 and sr.FTLVL == 0) break;
+                    _ = SPI1.DR.raw;
+                }
+            } else {
+                // HACK: wait long enough to make any device end an ongoing transfer
+                var i: u32 = 255; // with the 8MHz clock, this seems to delay ~185 microseconds
+                while (i > 0) : (i -= 1) {
+                    microzig.cpu.nop();
+                }
             }
         }
     };
